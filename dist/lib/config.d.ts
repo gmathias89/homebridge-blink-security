@@ -1,0 +1,65 @@
+import { type NetworkInterfaceInfo } from 'os';
+import { PlatformConfig } from 'homebridge';
+export interface BlinkSecurityConfig extends PlatformConfig {
+    username: string;
+    password: string;
+    pin?: string;
+    'hide-alarm'?: boolean;
+    'enable-alarm-triggering'?: boolean;
+    'hide-manual-arm-switch'?: boolean;
+    'hide-temperature-sensor'?: boolean;
+    'hide-enabled-switch'?: boolean;
+    'hide-privacy-switch'?: boolean;
+    'hide-cameras'?: boolean;
+    'hide-doorbells'?: boolean;
+    'enable-liveview'?: boolean;
+    'lv-save'?: boolean;
+    'disable-thumbnail-refresh'?: boolean;
+    'blink-status-polling-seconds'?: number;
+    'camera-thumbnail-refresh-seconds'?: number;
+    'camera-status-polling-seconds'?: number;
+    'camera-motion-polling-seconds'?: number;
+    logging?: 'quiet' | 'verbose' | 'debug';
+    'enable-startup-diagnostic'?: boolean;
+    'enable-audio'?: boolean;
+    'audio-filter'?: string;
+    'stream-address'?: string;
+    'local-storage-motion'?: 'auto' | 'always' | 'never';
+    'enable-push-notifications'?: boolean;
+    'push-sign-in-callback'?: string;
+}
+export type LocalStorageMotionMode = 'auto' | 'always' | 'never';
+export interface BlinkOptions {
+    username: string;
+    password: string;
+    pin?: string;
+    storagePath: string;
+    noAlarm: boolean;
+    alarmTriggering: boolean;
+    noManualArmSwitch: boolean;
+    noTemperatureSensor: boolean;
+    noEnabledSwitch: boolean;
+    noPrivacySwitch: boolean;
+    noCameras: boolean;
+    noDoorbells: boolean;
+    liveView: boolean;
+    lvSave: boolean;
+    noThumbnailRefresh: boolean;
+    blinkStatusPollingSeconds: number;
+    snapshotSeconds: number;
+    statusPollingSeconds: number;
+    motionPollingSeconds: number;
+    verbose: boolean;
+    debug: boolean;
+    startupDiagnostic: boolean;
+    enableAudio: boolean;
+    audioFilter: string;
+    streamAddress: string;
+    hideRoutineLogs: boolean;
+    localStorageMotion: LocalStorageMotionMode;
+    pushNotifications: boolean;
+    pushSignInCallback?: string;
+}
+export declare const DEFAULT_OPTIONS: BlinkOptions;
+export declare function normalizeConfig(config: BlinkSecurityConfig, warn?: (message: string) => void, interfaces?: NodeJS.Dict<NetworkInterfaceInfo[] | undefined>): BlinkOptions;
+//# sourceMappingURL=config.d.ts.map

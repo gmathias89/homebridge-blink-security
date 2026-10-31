@@ -1,0 +1,263 @@
+import { routineInfo } from '../lib/logInfo.js';
+import { BlinkCameraDelegate, CONFIGURED_ACCESSORIES, } from './cameraDelegate.js';
+export class DoorbellAccessory {
+    accessory;
+    doorbell;
+    log;
+    config;
+    Characteristic;
+    Service;
+    hap;
+    _controller;
+    _delegate;
+    doorbellService;
+    // Last value pushed by the poll loop, served to HomeKit reads.
+    lastMotion = false;
+    constructor(doorbell, api, log, config, cachedAccessories) {
+        this.doorbell = doorbell;
+        this.log = log;
+        this.config = config;
+        this.Characteristic = api.hap.Characteristic;
+        this.Service = api.hap.Service;
+        this.hap = api.hap;
+        const uuid = api.hap.uuid.generate(doorbell.canonicalID);
+        const existingAccessory = cachedAccessories.find(a => a.UUID === uuid);
+        if (existingAccessory) {
+            this.accessory = existingAccessory;
+        }
+        else {
+            this.accessory = new api.platformAccessory(`Blink ${doorbell.name}`, uuid, 18 /* Categories.VIDEO_DOORBELL */);
+        }
+        this.accessory.context.canonicalID = doorbell.canonicalID;
+        const existingContext = cachedAccessories
+            .map(a => a.context)
+            .find(c => c.canonicalID === doorbell.canonicalID);
+        if (existingContext) {
+            Object.assign(this.accessory.context, existingContext);
+        }
+        // Privacy mode defaults to OFF on every startup — users must explicitly enable it
+        this.accessory.context._privacy = false;
+        doorbell.context = this.accessory.context;
+        this.setupAccessoryInfo();
+        this.setupCameraController();
+        this.setupDoorbellService();
+        this.setupMotionSensor();
+        if (!config.noEnabledSwitch) {
+            this.setupEnabledSwitch();
+        }
+        if (!config.noPrivacySwitch) {
+            this.setupPrivacySwitch();
+        }
+        this.setupRecordClipSwitch();
+        this.cleanupStaleServices();
+    }
+    get platformAccessory() {
+        return this.accessory;
+    }
+    /**
+     * Release resources held on behalf of this accessory. Called when the
+     * device is removed from the account, so in-flight streams and their
+     * proxy servers do not outlive the accessory that owned them.
+     */
+    async shutdown() {
+        await this._delegate?.shutdown();
+    }
+    setupAccessoryInfo() {
+        const infoService = this.accessory.getService(this.Service.AccessoryInformation);
+        if (!infoService) {
+            return;
+        }
+        infoService
+            .setCharacteristic(this.Characteristic.Name, this.doorbell.name)
+            .setCharacteristic(this.Characteristic.Manufacturer, 'Blink');
+        if (this.doorbell.firmware) {
+            infoService.setCharacteristic(this.Characteristic.FirmwareRevision, this.doorbell.firmware);
+        }
+        if (this.doorbell.model) {
+            infoService.setCharacteristic(this.Characteristic.Model, this.doorbell.model);
+        }
+        if (this.doorbell.serial) {
+            infoService.setCharacteristic(this.Characteristic.SerialNumber, this.doorbell.serial);
+        }
+    }
+    setupCameraController() {
+        // See CameraAccessory: one camera controller per PlatformAccessory. Guard
+        // against a rebuild attaching a second one to a recycled accessory.
+        if (CONFIGURED_ACCESSORIES.has(this.accessory)) {
+            this.log.debug(`${this.doorbell.name}: camera controller already configured, skipping`);
+            return;
+        }
+        const delegate = new BlinkCameraDelegate(this.doorbell, this.log, this.hap, this.config.liveView, this.config.enableAudio, this.config.hideRoutineLogs, this.config.audioFilter, this.config.streamAddress);
+        const controllerOptions = {
+            cameraStreamCount: 2,
+            delegate,
+            streamingOptions: {
+                supportedCryptoSuites: [
+                    0 /* this.hap.SRTPCryptoSuites.AES_CM_128_HMAC_SHA1_80 */,
+                ],
+                video: {
+                    codec: {
+                        profiles: [
+                            0 /* this.hap.H264Profile.BASELINE */,
+                            1 /* this.hap.H264Profile.MAIN */,
+                        ],
+                        levels: [0 /* this.hap.H264Level.LEVEL3_1 */, 2 /* this.hap.H264Level.LEVEL4_0 */],
+                    },
+                    resolutions: [
+                        [1920, 1080, 15],
+                        [1280, 720, 30],
+                        [1280, 720, 15],
+                        [640, 480, 30],
+                        [640, 480, 15],
+                        [640, 360, 15],
+                        [480, 360, 15],
+                        [320, 240, 15],
+                    ],
+                },
+                audio: {
+                    twoWayAudio: false,
+                    codecs: [
+                        {
+                            type: "OPUS" /* this.hap.AudioStreamingCodecType.OPUS */,
+                            samplerate: 24 /* this.hap.AudioStreamingSamplerate.KHZ_24 */,
+                        },
+                        {
+                            type: "AAC-eld" /* this.hap.AudioStreamingCodecType.AAC_ELD */,
+                            samplerate: 16 /* this.hap.AudioStreamingSamplerate.KHZ_16 */,
+                        },
+                    ],
+                },
+            },
+        };
+        this._controller = new this.hap.CameraController(controllerOptions);
+        this._delegate = delegate;
+        delegate.controller = this._controller;
+        this.accessory.configureController(this._controller);
+        CONFIGURED_ACCESSORIES.add(this.accessory);
+    }
+    applyConfiguredName(service, name) {
+        service.addOptionalCharacteristic(this.Characteristic.ConfiguredName);
+        service.setCharacteristic(this.Characteristic.ConfiguredName, name);
+    }
+    setupDoorbellService() {
+        const existingDoorbellService = this.accessory.getServiceById(this.Service.Doorbell, `doorbell.${this.doorbell.serial}`);
+        const name = `${this.doorbell.name} Doorbell`;
+        this.doorbellService =
+            existingDoorbellService ||
+                this.accessory.addService(this.Service.Doorbell, name, `doorbell.${this.doorbell.serial}`);
+        if (!existingDoorbellService) {
+            this.applyConfiguredName(this.doorbellService, name);
+        }
+        this.doorbellService
+            .getCharacteristic(this.Characteristic.ProgrammableSwitchEvent)
+            .onGet(() => null);
+        this.doorbell.onPress = () => {
+            routineInfo(this.log, this.config, `${this.doorbell.name}: Doorbell pressed`);
+            this.doorbellService?.updateCharacteristic(this.Characteristic.ProgrammableSwitchEvent, this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS);
+        };
+    }
+    setupMotionSensor() {
+        const existingMotionService = this.accessory.getServiceById(this.Service.MotionSensor, `motion.${this.doorbell.serial}`);
+        const name = `${this.doorbell.name} Motion`;
+        const motionService = existingMotionService ||
+            this.accessory.addService(this.Service.MotionSensor, name, `motion.${this.doorbell.serial}`);
+        if (!existingMotionService) {
+            this.applyConfiguredName(motionService, name);
+        }
+        // Returns the value the poll loop last pushed rather than fetching:
+        // getMotionDetected hits the media endpoint, and HomeKit gives a read
+        // handler 10s before it declares the plugin unresponsive.
+        motionService
+            .getCharacteristic(this.Characteristic.MotionDetected)
+            .onGet(() => this.lastMotion);
+    }
+    setupEnabledSwitch() {
+        const existingSwitchService = this.accessory.getServiceById(this.Service.Switch, `enabled.${this.doorbell.serial}`);
+        const name = `${this.doorbell.name} Motion Enabled`;
+        const service = existingSwitchService ||
+            this.accessory.addService(this.Service.Switch, name, `enabled.${this.doorbell.serial}`);
+        if (!existingSwitchService) {
+            this.applyConfiguredName(service, name);
+        }
+        service
+            .getCharacteristic(this.Characteristic.On)
+            .onGet(() => this.doorbell.getEnabled())
+            .onSet(async (value) => {
+            await this.doorbell.setEnabled(value);
+        });
+    }
+    setupPrivacySwitch() {
+        const existingSwitchService = this.accessory.getServiceById(this.Service.Switch, `privacy.${this.doorbell.serial}`);
+        const name = `${this.doorbell.name} Privacy Mode`;
+        const service = existingSwitchService ||
+            this.accessory.addService(this.Service.Switch, name, `privacy.${this.doorbell.serial}`);
+        if (!existingSwitchService) {
+            this.applyConfiguredName(service, name);
+        }
+        service
+            .getCharacteristic(this.Characteristic.On)
+            .onGet(() => this.doorbell.privacyMode)
+            .onSet(value => {
+            this.doorbell.privacyMode = value;
+        });
+    }
+    setupRecordClipSwitch() {
+        const existingSwitchService = this.accessory.getServiceById(this.Service.Switch, `record.${this.doorbell.serial}`);
+        const name = `${this.doorbell.name} Record Clip`;
+        const service = existingSwitchService ||
+            this.accessory.addService(this.Service.Switch, name, `record.${this.doorbell.serial}`);
+        if (!existingSwitchService) {
+            this.applyConfiguredName(service, name);
+        }
+        service
+            .getCharacteristic(this.Characteristic.On)
+            .onGet(() => false)
+            .onSet(async (value) => {
+            if (value) {
+                try {
+                    routineInfo(this.log, this.config, `${this.doorbell.name}: Recording clip`);
+                    await this.doorbell.recordClip();
+                }
+                finally {
+                    setTimeout(() => {
+                        service.updateCharacteristic(this.Characteristic.On, false);
+                    }, 1000);
+                }
+            }
+        });
+    }
+    /** Push updated values to HomeKit (called from poll loop). */
+    updateState() {
+        const motionService = this.accessory.getService(this.Service.MotionSensor);
+        if (motionService) {
+            this.doorbell
+                .getMotionDetected()
+                .then(motion => {
+                this.lastMotion = motion;
+                motionService.updateCharacteristic(this.Characteristic.MotionDetected, motion);
+            })
+                .catch(() => {
+                /* ignore */
+            });
+        }
+        const enabledService = this.accessory.getService(`enabled.${this.doorbell.serial}`);
+        if (enabledService) {
+            enabledService.updateCharacteristic(this.Characteristic.On, this.doorbell.getEnabled());
+        }
+    }
+    cleanupStaleServices() {
+        const removeSwitch = (subtype) => {
+            const svc = this.accessory.getServiceById(this.Service.Switch, subtype);
+            if (svc) {
+                this.accessory.removeService(svc);
+            }
+        };
+        if (this.config.noEnabledSwitch) {
+            removeSwitch(`enabled.${this.doorbell.serial}`);
+        }
+        if (this.config.noPrivacySwitch) {
+            removeSwitch(`privacy.${this.doorbell.serial}`);
+        }
+    }
+}
+//# sourceMappingURL=doorbell.js.map

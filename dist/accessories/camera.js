@@ -1,0 +1,339 @@
+import { routineInfo } from '../lib/logInfo.js';
+import { BlinkCameraDelegate, CONFIGURED_ACCESSORIES, } from './cameraDelegate.js';
+export class CameraAccessory {
+    accessory;
+    camera;
+    log;
+    config;
+    Characteristic;
+    Service;
+    hap;
+    _controller;
+    _delegate;
+    // Last value pushed by the poll loop, served to HomeKit reads.
+    lastMotion = false;
+    constructor(camera, api, log, config, cachedAccessories) {
+        this.camera = camera;
+        this.log = log;
+        this.config = config;
+        this.Characteristic = api.hap.Characteristic;
+        this.Service = api.hap.Service;
+        this.hap = api.hap;
+        const uuid = api.hap.uuid.generate(camera.canonicalID);
+        const existingAccessory = cachedAccessories.find(a => a.UUID === uuid);
+        if (existingAccessory) {
+            this.accessory = existingAccessory;
+        }
+        else {
+            this.accessory = new api.platformAccessory(`Blink ${camera.name}`, uuid, 17 /* Categories.CAMERA */);
+        }
+        this.accessory.context.canonicalID = camera.canonicalID;
+        const existingContext = cachedAccessories
+            .map(a => a.context)
+            .find(c => c.canonicalID === camera.canonicalID);
+        if (existingContext) {
+            Object.assign(this.accessory.context, existingContext);
+        }
+        // Privacy mode defaults to OFF on every startup — users must explicitly enable it
+        this.accessory.context._privacy = false;
+        camera.context = this.accessory.context;
+        this.setupAccessoryInfo();
+        this.setupCameraController();
+        this.setupMotionSensor();
+        if (camera.isBatteryPower) {
+            this.setupBattery();
+        }
+        if (!camera.isCameraMini && !config.noTemperatureSensor) {
+            this.setupTemperatureSensor();
+        }
+        if (!config.noEnabledSwitch) {
+            this.setupEnabledSwitch();
+        }
+        if (!config.noPrivacySwitch) {
+            this.setupPrivacySwitch();
+        }
+        if (!camera.isCameraMini) {
+            this.setupNightVisionSwitch();
+        }
+        this.setupRecordClipSwitch();
+        this.cleanupStaleServices();
+    }
+    get platformAccessory() {
+        return this.accessory;
+    }
+    /**
+     * Release resources held on behalf of this accessory. Called when the
+     * device is removed from the account, so in-flight streams and their
+     * proxy servers do not outlive the accessory that owned them.
+     */
+    async shutdown() {
+        await this._delegate?.shutdown();
+    }
+    setupAccessoryInfo() {
+        const infoService = this.accessory.getService(this.Service.AccessoryInformation);
+        if (!infoService) {
+            return;
+        }
+        infoService
+            .setCharacteristic(this.Characteristic.Name, this.camera.name)
+            .setCharacteristic(this.Characteristic.Manufacturer, 'Blink');
+        if (this.camera.firmware) {
+            infoService.setCharacteristic(this.Characteristic.FirmwareRevision, this.camera.firmware);
+        }
+        if (this.camera.model) {
+            infoService.setCharacteristic(this.Characteristic.Model, this.camera.model);
+        }
+        if (this.camera.serial) {
+            infoService.setCharacteristic(this.Characteristic.SerialNumber, this.camera.serial);
+        }
+    }
+    setupCameraController() {
+        // A PlatformAccessory can only carry one camera controller. The platform
+        // reuses accessory wrappers so this normally runs once per device, but
+        // guard here too: a rebuild against a recycled accessory (config toggled,
+        // device disappearing and returning) would otherwise attach a second
+        // controller to an accessory that already has one.
+        if (CONFIGURED_ACCESSORIES.has(this.accessory)) {
+            this.log.debug(`${this.camera.name}: camera controller already configured, skipping`);
+            return;
+        }
+        const delegate = new BlinkCameraDelegate(this.camera, this.log, this.hap, this.config.liveView, this.config.enableAudio, this.config.hideRoutineLogs, this.config.audioFilter, this.config.streamAddress);
+        const controllerOptions = {
+            cameraStreamCount: 2,
+            delegate,
+            streamingOptions: {
+                supportedCryptoSuites: [
+                    0 /* this.hap.SRTPCryptoSuites.AES_CM_128_HMAC_SHA1_80 */,
+                ],
+                video: {
+                    codec: {
+                        profiles: [
+                            0 /* this.hap.H264Profile.BASELINE */,
+                            1 /* this.hap.H264Profile.MAIN */,
+                        ],
+                        levels: [0 /* this.hap.H264Level.LEVEL3_1 */, 2 /* this.hap.H264Level.LEVEL4_0 */],
+                    },
+                    resolutions: [
+                        [1920, 1080, 15],
+                        [1280, 720, 30],
+                        [1280, 720, 15],
+                        [640, 480, 30],
+                        [640, 480, 15],
+                        [640, 360, 15],
+                        [480, 360, 15],
+                        [320, 240, 15],
+                    ],
+                },
+                audio: {
+                    twoWayAudio: false,
+                    codecs: [
+                        {
+                            type: "OPUS" /* this.hap.AudioStreamingCodecType.OPUS */,
+                            samplerate: 24 /* this.hap.AudioStreamingSamplerate.KHZ_24 */,
+                        },
+                        {
+                            type: "AAC-eld" /* this.hap.AudioStreamingCodecType.AAC_ELD */,
+                            samplerate: 16 /* this.hap.AudioStreamingSamplerate.KHZ_16 */,
+                        },
+                    ],
+                },
+            },
+        };
+        this._controller = new this.hap.CameraController(controllerOptions);
+        this._delegate = delegate;
+        delegate.controller = this._controller;
+        this.accessory.configureController(this._controller);
+        CONFIGURED_ACCESSORIES.add(this.accessory);
+        const cameraMode = this.accessory.getService(this.Service.CameraOperatingMode);
+        if (cameraMode) {
+            cameraMode
+                .getCharacteristic(this.Characteristic.ManuallyDisabled)
+                .onGet(() => !this.camera.enabled);
+        }
+    }
+    applyConfiguredName(service, name) {
+        service.addOptionalCharacteristic(this.Characteristic.ConfiguredName);
+        service.setCharacteristic(this.Characteristic.ConfiguredName, name);
+    }
+    setupMotionSensor() {
+        const existingMotionService = this.accessory.getServiceById(this.Service.MotionSensor, `motion.${this.camera.serial}`);
+        const name = `${this.camera.name} Motion`;
+        const motionService = existingMotionService ||
+            this.accessory.addService(this.Service.MotionSensor, name, `motion.${this.camera.serial}`);
+        if (!existingMotionService) {
+            this.applyConfiguredName(motionService, name);
+        }
+        // Returns the value the poll loop last pushed rather than fetching:
+        // getMotionDetected hits the media endpoint, and HomeKit gives a read
+        // handler 10s before it declares the plugin unresponsive.
+        motionService
+            .getCharacteristic(this.Characteristic.MotionDetected)
+            .onGet(() => this.lastMotion);
+    }
+    setupBattery() {
+        const existingBatteryService = this.accessory.getServiceById(this.Service.Battery, `battery-sensor.${this.camera.serial}`);
+        const name = `${this.camera.name} Battery`;
+        const batteryService = existingBatteryService ||
+            this.accessory.addService(this.Service.Battery, name, `battery-sensor.${this.camera.serial}`);
+        if (!existingBatteryService) {
+            this.applyConfiguredName(batteryService, name);
+        }
+        batteryService
+            .getCharacteristic(this.Characteristic.StatusLowBattery)
+            .onGet(() => {
+            return this.camera.lowBattery
+                ? this.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+                : this.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL;
+        });
+        batteryService
+            .getCharacteristic(this.Characteristic.BatteryLevel)
+            .onGet(() => this.camera.batteryLevel ?? 0);
+    }
+    setupTemperatureSensor() {
+        const existingTempService = this.accessory.getServiceById(this.Service.TemperatureSensor, `temp-sensor.${this.camera.serial}`);
+        const name = `${this.camera.name} Temperature`;
+        const tempService = existingTempService ||
+            this.accessory.addService(this.Service.TemperatureSensor, name, `temp-sensor.${this.camera.serial}`);
+        if (!existingTempService) {
+            this.applyConfiguredName(tempService, name);
+        }
+        tempService
+            .getCharacteristic(this.Characteristic.CurrentTemperature)
+            .setProps({ minValue: -100 });
+        tempService
+            .getCharacteristic(this.Characteristic.CurrentTemperature)
+            .onGet(() => this.camera.temperature ?? 0);
+    }
+    setupEnabledSwitch() {
+        const existingSwitchService = this.accessory.getServiceById(this.Service.Switch, `enabled.${this.camera.serial}`);
+        const name = `${this.camera.name} Motion Enabled`;
+        const service = existingSwitchService ||
+            this.accessory.addService(this.Service.Switch, name, `enabled.${this.camera.serial}`);
+        if (!existingSwitchService) {
+            this.applyConfiguredName(service, name);
+        }
+        service
+            .getCharacteristic(this.Characteristic.On)
+            .onGet(() => this.camera.getEnabled())
+            .onSet(async (value) => {
+            await this.camera.setEnabled(value);
+        });
+    }
+    setupPrivacySwitch() {
+        const existingSwitchService = this.accessory.getServiceById(this.Service.Switch, `privacy.${this.camera.serial}`);
+        const name = `${this.camera.name} Privacy Mode`;
+        const service = existingSwitchService ||
+            this.accessory.addService(this.Service.Switch, name, `privacy.${this.camera.serial}`);
+        if (!existingSwitchService) {
+            this.applyConfiguredName(service, name);
+        }
+        service
+            .getCharacteristic(this.Characteristic.On)
+            .onGet(() => this.camera.privacyMode)
+            .onSet(value => {
+            this.camera.privacyMode = value;
+        });
+    }
+    setupNightVisionSwitch() {
+        const existingSwitchService = this.accessory.getServiceById(this.Service.Switch, `nightvision.${this.camera.serial}`);
+        const name = `${this.camera.name} Night Vision`;
+        const service = existingSwitchService ||
+            this.accessory.addService(this.Service.Switch, name, `nightvision.${this.camera.serial}`);
+        if (!existingSwitchService) {
+            this.applyConfiguredName(service, name);
+        }
+        service
+            .getCharacteristic(this.Characteristic.On)
+            .onGet(() => this.camera.nightVision)
+            .onSet(async (value) => {
+            await this.camera.setNightVision(value);
+        });
+    }
+    setupRecordClipSwitch() {
+        const existingSwitchService = this.accessory.getServiceById(this.Service.Switch, `record.${this.camera.serial}`);
+        const name = `${this.camera.name} Record Clip`;
+        const service = existingSwitchService ||
+            this.accessory.addService(this.Service.Switch, name, `record.${this.camera.serial}`);
+        if (!existingSwitchService) {
+            this.applyConfiguredName(service, name);
+        }
+        service
+            .getCharacteristic(this.Characteristic.On)
+            .onGet(() => false)
+            .onSet(async (value) => {
+            if (value) {
+                try {
+                    routineInfo(this.log, this.config, `${this.camera.name}: Recording clip`);
+                    await this.camera.recordClip();
+                }
+                finally {
+                    setTimeout(() => {
+                        service.updateCharacteristic(this.Characteristic.On, false);
+                    }, 1000);
+                }
+            }
+        });
+    }
+    /** Push updated values to HomeKit (called from poll loop). */
+    updateState() {
+        const motionService = this.accessory.getService(this.Service.MotionSensor);
+        if (motionService) {
+            this.camera
+                .getMotionDetected()
+                .then(motion => {
+                this.lastMotion = motion;
+                motionService.updateCharacteristic(this.Characteristic.MotionDetected, motion);
+            })
+                .catch(() => {
+                /* ignore */
+            });
+        }
+        const enabledService = this.accessory.getService(`enabled.${this.camera.serial}`);
+        if (enabledService) {
+            enabledService.updateCharacteristic(this.Characteristic.On, this.camera.getEnabled());
+        }
+        if (this.camera.isBatteryPower) {
+            const batteryService = this.accessory.getService(this.Service.Battery);
+            if (batteryService) {
+                batteryService.updateCharacteristic(this.Characteristic.BatteryLevel, this.camera.batteryLevel ?? 0);
+                batteryService.updateCharacteristic(this.Characteristic.StatusLowBattery, this.camera.lowBattery
+                    ? this.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+                    : this.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL);
+            }
+        }
+        const tempService = this.accessory.getService(this.Service.TemperatureSensor);
+        if (tempService) {
+            tempService.updateCharacteristic(this.Characteristic.CurrentTemperature, this.camera.temperature ?? 0);
+        }
+    }
+    cleanupStaleServices() {
+        const removeSwitch = (subtype) => {
+            const svc = this.accessory.getServiceById(this.Service.Switch, subtype);
+            if (svc) {
+                this.accessory.removeService(svc);
+            }
+        };
+        if (this.config.noEnabledSwitch) {
+            removeSwitch(`enabled.${this.camera.serial}`);
+        }
+        if (this.config.noPrivacySwitch) {
+            removeSwitch(`privacy.${this.camera.serial}`);
+        }
+        if (this.camera.isCameraMini) {
+            removeSwitch(`nightvision.${this.camera.serial}`);
+        }
+        if (!this.camera.isBatteryPower) {
+            const bat = this.accessory.getService(this.Service.Battery);
+            if (bat) {
+                this.accessory.removeService(bat);
+            }
+        }
+        if (this.camera.isCameraMini || this.config.noTemperatureSensor) {
+            const temp = this.accessory.getService(this.Service.TemperatureSensor);
+            if (temp) {
+                this.accessory.removeService(temp);
+            }
+        }
+    }
+}
+//# sourceMappingURL=camera.js.map

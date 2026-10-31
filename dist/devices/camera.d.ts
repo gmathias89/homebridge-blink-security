@@ -1,0 +1,46 @@
+import { BlinkDevice, type HomescreenCamera } from './base.js';
+import type { BlinkNetwork } from './network.js';
+import { type Blink } from './index.js';
+export declare const KNOWN_OWL_CODENAMES: string[];
+export declare class BlinkCamera extends BlinkDevice {
+    readonly id: number;
+    blink: Blink;
+    readonly isOwlDevice: boolean;
+    private cacheThumbnail;
+    private motionTrace;
+    lastThumbnailRequest: number;
+    private lastGoodThumbnail?;
+    constructor(data: HomescreenCamera, blink: Blink, isOwlDevice?: boolean);
+    get data(): HomescreenCamera;
+    set data(newInfo: HomescreenCamera);
+    get cameraID(): number;
+    get canonicalID(): string;
+    get status(): string | undefined;
+    get online(): boolean;
+    get armed(): boolean;
+    get enabled(): boolean;
+    get thumbnail(): string;
+    get network(): BlinkNetwork | undefined;
+    get privacyMode(): boolean;
+    set privacyMode(val: boolean);
+    get thumbnailCreatedAt(): number;
+    set thumbnailCreatedAt(val: number);
+    get isBatteryPower(): boolean;
+    get lowBattery(): boolean | null;
+    get batteryLevel(): number | null;
+    get isCameraMini(): boolean;
+    get temperature(): number | null;
+    getMotionDetected(): Promise<boolean>;
+    private traceMotion;
+    getEnabled(): boolean;
+    setEnabled(target?: boolean): Promise<void>;
+    get nightVision(): boolean;
+    set nightVision(val: boolean);
+    setNightVision(enabled: boolean): Promise<void>;
+    recordClip(): Promise<void>;
+    refreshThumbnail(force?: boolean): Promise<void>;
+    getThumbnail(includeMotion?: boolean): Promise<Buffer | undefined>;
+    clearThumbnailCache(): void;
+    getLiveViewURL(timeout?: number): Promise<string | undefined>;
+}
+//# sourceMappingURL=camera.d.ts.map

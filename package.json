@@ -1,7 +1,7 @@
 {
   "displayName": "Blink Security",
   "name": "@jackietreeh0rn/homebridge-blink-security",
-  "version": "2.0.10",
+  "version": "2.0.10-push.4",
   "description": "Homebridge plugin for Amazon Blink security cameras",
   "keywords": [
     "homebridge",
@@ -57,7 +57,6 @@
     "test": "vitest run --reporter=verbose",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "prepare": "husky",
     "tsc": "tsc --noEmit",
     "dev-setup": "npm run setup-config && npm run setup-log",
     "setup-config": "if [ ! -f ./test/hbConfig/config.json ]; then cp ./test/hbConfig/config-template.json ./test/hbConfig/config.json; fi",

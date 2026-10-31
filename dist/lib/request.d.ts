@@ -1,0 +1,25 @@
+export declare const OAUTH_BASE_URL = "https://api.oauth.blink.com";
+export declare const OAUTH_AUTHORIZE_PATH = "/oauth/v2/authorize";
+export declare const OAUTH_SIGNIN_PATH = "/oauth/v2/signin";
+export declare const OAUTH_2FA_VERIFY_PATH = "/oauth/v2/2fa/verify";
+export declare const OAUTH_TOKEN_PATH = "/oauth/token";
+export declare const OAUTH_CLIENT_ID = "ios";
+export declare const OAUTH_SCOPE = "client";
+export declare const OAUTH_REDIRECT_URI = "immedia-blink://applinks.blink.com/signin/callback";
+export declare const OAUTH_RESPONSE_TYPE = "code";
+export declare const OAUTH_CODE_CHALLENGE_METHOD = "S256";
+export declare const BLINK_API_HOST = "immedia-semi.com";
+export declare const BLINK_API_DEFAULT_REGION = "prod";
+export declare const BLINK_TIER_INFO_PATH = "/api/v1/users/tier_info";
+export declare function getRegionBaseURL(region: string): string;
+export declare const APP_VERSION = "50.1";
+export declare const APP_BRAND = "blink";
+export declare const DEVICE_BRAND = "Apple";
+export declare const DEVICE_IDENTIFIER = "iPhone16,1";
+export declare const OS_VERSION = "26.1";
+export declare const OAUTH_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Mobile/15E148 Safari/604.1";
+export declare const OAUTH_SIGNIN_URL = "https://api.oauth.blink.com/oauth/v2/signin";
+export declare const OAUTH_TOKEN_USER_AGENT = "Blink/2511191620 CFNetwork/3860.200.71 Darwin/25.1.0";
+export declare const DEFAULT_HEADERS: Record<string, string>;
+export declare const TOKEN_EXPIRY_BUFFER_MS: number;
+//# sourceMappingURL=request.d.ts.map

@@ -1,0 +1,605 @@
+import { spawn } from 'child_process';
+import { writeFile, unlink } from 'fs/promises';
+import { networkInterfaces, tmpdir } from 'os';
+import { join } from 'path';
+import { getDefaultIpAddress, reservePorts } from '@homebridge/camera-utils';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const pathToFfmpeg = require('ffmpeg-for-homebridge');
+import { ImmiTunnel, RtspToH264Proxy } from '../lib/proxy.js';
+import { rtpLocalAddress, rtpOutputUrl, selectStreamAddress, } from '../lib/streamAddress.js';
+import { sleep } from '../lib/utils.js';
+/**
+ * PlatformAccessory objects that already carry a camera controller.
+ *
+ * Deliberately process-local and NOT stored on `accessory.context`: context is
+ * serialized to Homebridge's accessory cache and restored on boot, so a
+ * persisted flag would make every camera skip controller setup after the first
+ * restart, leaving it with no live view or snapshots.
+ */
+export const CONFIGURED_ACCESSORIES = new WeakSet();
+export class BlinkCameraDelegate {
+    blinkCamera;
+    log;
+    hap;
+    liveViewEnabled;
+    audioEnabled;
+    audioFilter;
+    streamAddress;
+    hideRoutineLogs;
+    controller;
+    pendingSessions = new Map();
+    proxySessions = new Map();
+    ongoingSessions = new Map();
+    streamTimeouts = new Map();
+    streamStartTimes = new Map();
+    streamRetries = new Map();
+    sessionInfoCache = new Map();
+    outputErrorSessions = new Set();
+    audioDisabledSessions = new Set();
+    lastForcedRefresh = 0;
+    // Set by shutdown(). Async stream paths check it after every suspension
+    // point so a retry parked in a sleep cannot resurrect ffmpeg children or
+    // proxy servers on an accessory that has already been torn down.
+    destroyed = false;
+    static RETRYABLE_FFMPEG_CODES = new Set([251, 187]);
+    static MAX_STREAM_RETRIES = 2;
+    static RETRY_DELAY_MS = 2000;
+    constructor(blinkCamera, log, hap, liveViewEnabled = true, audioEnabled = false, hideRoutineLogs = false, audioFilter = '', streamAddress = '') {
+        this.blinkCamera = blinkCamera;
+        this.log = log;
+        this.hap = hap;
+        this.liveViewEnabled = liveViewEnabled;
+        this.audioEnabled = audioEnabled;
+        this.hideRoutineLogs = hideRoutineLogs;
+        this.audioFilter = audioFilter;
+        this.streamAddress = streamAddress;
+    }
+    async handleSnapshotRequest(request, callback) {
+        this.log.debug(`${this.blinkCamera.name} - handleSnapshotRequest(${request.width}x${request.height})`);
+        try {
+            const bytes = await this.blinkCamera.getThumbnail();
+            const size = bytes ? bytes.length : 0;
+            if (size === 0) {
+                const url = this.blinkCamera.thumbnail;
+                this.log.warn(`${this.blinkCamera.name} - Snapshot: 0 bytes (${request.width}x${request.height}) — ${url ? `URL: ${url}` : 'no thumbnail URL'}`);
+            }
+            else {
+                this.log.debug(`${this.blinkCamera.name} - Snapshot served (cached): ${size} bytes (${request.width}x${request.height})`);
+            }
+            callback(undefined, bytes ?? Buffer.alloc(0));
+            // Refresh thumbnail in background for next request
+            // Force when empty, but rate-limit to once per 5 minutes to avoid 409 conflicts
+            const shouldForce = size === 0 && Date.now() - this.lastForcedRefresh > 300_000;
+            if (shouldForce) {
+                this.lastForcedRefresh = Date.now();
+            }
+            this.blinkCamera
+                .refreshThumbnail(shouldForce)
+                .catch(e => this.log.error(`${this.blinkCamera.name} - Refresh error:`, e));
+        }
+        catch (err) {
+            this.log.error(`${this.blinkCamera.name} - Snapshot error:`, err);
+            // Return empty buffer instead of error — returning an error causes HomeKit to mark the accessory as unresponsive
+            callback(undefined, Buffer.alloc(0));
+        }
+    }
+    async prepareStream(request, callback) {
+        this.log.debug(`${this.blinkCamera.name} - prepareStream()`);
+        const videoSSRC = this.hap.CameraController.generateSynchronisationSource();
+        const audioSSRC = this.hap.CameraController.generateSynchronisationSource();
+        const ipv6 = request.addressVersion === 'ipv6';
+        const defaultAddress = await getDefaultIpAddress(ipv6);
+        const selected = ipv6
+            ? undefined
+            : selectStreamAddress(request.targetAddress, networkInterfaces(), this.streamAddress, defaultAddress);
+        const sourceAddress = selected?.address ?? defaultAddress;
+        const localAddress = ipv6
+            ? undefined
+            : rtpLocalAddress(sourceAddress, defaultAddress);
+        if (localAddress && !this.hideRoutineLogs) {
+            this.log.info(`${this.blinkCamera.name} - LiveView source ${localAddress} (${selected?.reason}); default route is ${defaultAddress}`);
+        }
+        const sessionInfo = {
+            address: request.targetAddress,
+            localAddress,
+            videoPort: request.video.port,
+            videoCryptoSuite: request.video.srtpCryptoSuite,
+            videoSRTP: Buffer.concat([
+                request.video.srtp_key,
+                request.video.srtp_salt,
+            ]),
+            videoSSRC,
+            audioPort: request.audio.port,
+            audioCryptoSuite: request.audio.srtpCryptoSuite,
+            audioSRTP: Buffer.concat([
+                request.audio.srtp_key,
+                request.audio.srtp_salt,
+            ]),
+            audioSSRC,
+        };
+        const audioResponse = request.audio
+            ? {
+                port: request.audio.port,
+                ssrc: audioSSRC,
+                srtp_key: request.audio.srtp_key,
+                srtp_salt: request.audio.srtp_salt,
+            }
+            : undefined;
+        const response = {
+            addressOverride: sourceAddress,
+            video: {
+                port: request.video.port,
+                ssrc: videoSSRC,
+                srtp_key: request.video.srtp_key,
+                srtp_salt: request.video.srtp_salt,
+            },
+            audio: audioResponse,
+        };
+        this.pendingSessions.set(request.sessionID, sessionInfo);
+        this.proxySessions.set(request.sessionID, { path: undefined });
+        let liveViewURL;
+        if (this.liveViewEnabled) {
+            try {
+                liveViewURL = await this.blinkCamera.getLiveViewURL(30);
+            }
+            catch (err) {
+                this.log.warn(`${this.blinkCamera.name} - LiveView request failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
+        if (liveViewURL) {
+            this.log.debug(`${this.blinkCamera.name} - LiveView: ${liveViewURL}`);
+        }
+        else {
+            this.log.warn(`${this.blinkCamera.name} - LiveView: unavailable`);
+        }
+        const urlRegex = /([a-z]+):\/\/([^:/]+)(?::[0-9]+)?(\/.*)/;
+        if (liveViewURL?.startsWith('immis') && urlRegex.test(liveViewURL)) {
+            // IMMI protocol — MPEG-TS over TLS
+            const [, protocol, host, path] = urlRegex.exec(liveViewURL);
+            // Extract connectionId, serial, and clientId from the IMMI URL
+            // URL format: immis://HOST:443/CONNECTION_ID__IMDS_SERIAL?client_id=CAMERA_ID
+            const pathWithoutQuery = path.split('?')[0].replace(/^\//, '');
+            const connectionId = pathWithoutQuery.replace(/__.*$/, '');
+            const imdsMatch = pathWithoutQuery.match(/__IMDS_(.+)$/);
+            const serial = imdsMatch ? imdsMatch[1].substring(0, 16) : '';
+            const clientIdParam = new URL(liveViewURL.replace('immis://', 'https://')).searchParams.get('client_id');
+            const clientId = clientIdParam ? parseInt(clientIdParam, 10) : 0;
+            const [listenPort] = await reservePorts({ count: 1 });
+            const proxyServer = await this.createImmiTunnel(listenPort, host, clientId, connectionId, serial);
+            this.proxySessions.set(request.sessionID, {
+                protocol,
+                host,
+                path,
+                listenPort,
+                proxyServer,
+                isImmi: true,
+            });
+        }
+        else if (liveViewURL?.startsWith('rtsp') && urlRegex.test(liveViewURL)) {
+            // RTSPS — proxy handles RTSP negotiation and serves MPEG-TS over local TCP
+            const [, protocol, host, path] = urlRegex.exec(liveViewURL);
+            const [listenPort] = await reservePorts({ count: 1 });
+            const proxyServer = new RtspToH264Proxy(listenPort, host, path, '0.0.0.0', 443, this.log);
+            await proxyServer.start();
+            this.proxySessions.set(request.sessionID, {
+                protocol,
+                host,
+                path,
+                listenPort,
+                proxyServer,
+                isRtsp: true,
+            });
+        }
+        else if (liveViewURL) {
+            this.proxySessions.set(request.sessionID, { path: liveViewURL });
+        }
+        else {
+            // No live view — save thumbnail to temp file as static fallback
+            try {
+                const thumbnail = await this.blinkCamera.getThumbnail();
+                if (thumbnail && thumbnail.length > 0) {
+                    const tmpPath = join(tmpdir(), `blink-snapshot-${request.sessionID}.jpg`);
+                    await writeFile(tmpPath, thumbnail);
+                    this.proxySessions.set(request.sessionID, { path: tmpPath });
+                }
+            }
+            catch (err) {
+                this.log.warn(`${this.blinkCamera.name} - Thumbnail fallback failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
+        callback(undefined, response);
+    }
+    async handleStreamRequest(request, callback) {
+        this.log.debug(`${this.blinkCamera.name} - handleStreamRequest()`);
+        if (request.type === "start" /* StreamRequestTypes.START */) {
+            await this.startStream(request.sessionID, request.video, request.audio);
+        }
+        else if (request.type === "reconfigure" /* StreamRequestTypes.RECONFIGURE */) {
+            const v = request.video;
+            if (!this.hideRoutineLogs) {
+                this.log.info(`${this.blinkCamera.name} - LiveView RECONFIGURE` +
+                    ` (${v.width}x${v.height}, ${v.fps} fps, ${v.max_bit_rate} kbps)`);
+            }
+            // Acknowledge reconfigure — we can't change the Blink stream parameters
+            // mid-stream, but acknowledging prevents HomeKit from killing the stream.
+        }
+        else if (request.type === "stop" /* StreamRequestTypes.STOP */) {
+            await this.stopStream(request.sessionID);
+        }
+        callback();
+    }
+    async startStream(sessionID, video, audio) {
+        const sessionInfo = this.pendingSessions.get(sessionID);
+        if (!sessionInfo) {
+            return;
+        }
+        const rtspProxy = this.proxySessions.get(sessionID);
+        // No valid video source — can't start stream
+        if (!rtspProxy?.proxyServer && !rtspProxy?.path) {
+            this.log.warn(`${this.blinkCamera.name} - No video source available, cannot start stream`);
+            this.pendingSessions.delete(sessionID);
+            this.controller?.forceStopStreamingSession(sessionID);
+            return;
+        }
+        const payloadType = video.pt;
+        const maxBitrate = video.max_bit_rate;
+        const address = sessionInfo.address;
+        const videoPort = sessionInfo.videoPort;
+        const videoSRTP = sessionInfo.videoSRTP.toString('base64');
+        const phase = this.audioDisabledSessions.has(sessionID)
+            ? 'RESTART (video-only)'
+            : 'START';
+        if (!this.hideRoutineLogs) {
+            this.log.info(`${this.blinkCamera.name} - LiveView ${phase} (${video.width}x${video.height}, ${video.fps} fps, ${maxBitrate} kbps)`);
+        }
+        const ffmpegArgs = [];
+        // IMMI streams have audio; RTSP XT streams are video-only; static fallback has none.
+        // Audio output is opt-in via config because some camera privacy settings send
+        // malformed audio metadata (0 channels) that stalls the ffmpeg pipeline.
+        // A session that previously hit 0-channel audio is marked as audio-disabled
+        // and stays that way for the rest of the session.
+        const hasAudio = this.audioEnabled &&
+            !this.audioDisabledSessions.has(sessionID) &&
+            !!rtspProxy?.proxyServer &&
+            !rtspProxy?.isRtsp;
+        if (rtspProxy?.isImmi && rtspProxy.proxyServer) {
+            // IMMI protocol — MPEG-TS input from local tunnel
+            ffmpegArgs.push('-hide_banner', '-loglevel', 'warning', '-analyzeduration', '2000000', '-probesize', '262144', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err', '-flags', 'low_delay', '-f', 'mpegts', '-i', 'pipe:0', '-map', '0:v', '-vcodec', 'copy', '-sn', '-dn');
+        }
+        else if (rtspProxy?.isRtsp && rtspProxy.proxyServer) {
+            // RTSPS via RTSP-to-MPEGTS proxy — the proxy handles RTSP negotiation,
+            // strips interleaved framing and RTP headers, serves raw MPEG-TS over TCP.
+            // Re-encode with libx264 to smooth bursty frame delivery from Blink XT
+            // and produce immediate keyframes (source has ~8s keyframe interval).
+            // Use CRF for consistent quality instead of bitrate caps that starve the encoder.
+            ffmpegArgs.push('-hide_banner', '-loglevel', 'warning', '-analyzeduration', '0', '-probesize', '131072', '-fflags', '+nobuffer+discardcorrupt', '-flags', 'low_delay', '-f', 'mpegts', '-i', `tcp://localhost:${rtspProxy.listenPort}`, '-fps_mode', 'passthrough', '-map', '0:v', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p', '-profile:v', 'baseline', '-crf', '23', '-g', '30', '-sn', '-dn');
+        }
+        else {
+            ffmpegArgs.push('-hide_banner', '-loglevel', 'warning', '-loop', '1', '-framerate', '1', '-re', '-f', 'image2', '-i', rtspProxy?.path ?? '', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-profile:v', 'baseline', '-s', `${video.width}x${video.height}`, '-g', '300', '-r', '10', '-an', '-sn', '-dn', '-b:v', `${maxBitrate}k`, '-bufsize', `${2 * maxBitrate}k`, '-maxrate', `${maxBitrate}k`);
+        }
+        ffmpegArgs.push('-payload_type', String(payloadType), '-f', 'rtp');
+        let targetProtocol = 'rtp';
+        if (sessionInfo.videoCryptoSuite ===
+            0 /* this.hap.SRTPCryptoSuites.AES_CM_128_HMAC_SHA1_80 */) {
+            ffmpegArgs.push('-ssrc', String(sessionInfo.videoSSRC), '-srtp_out_suite', 'AES_CM_128_HMAC_SHA1_80', '-srtp_out_params', videoSRTP);
+            targetProtocol = 'srtp';
+        }
+        ffmpegArgs.push(rtpOutputUrl(targetProtocol, address, videoPort, video.mtu, sessionInfo.localAddress));
+        // Audio output — transcode AAC from camera to OPUS for HomeKit
+        if (hasAudio) {
+            const audioSRTP = sessionInfo.audioSRTP.toString('base64');
+            const audioPort = sessionInfo.audioPort;
+            ffmpegArgs.push('-map', '0:a:0?');
+            // Optional user-supplied ffmpeg audio filtergraph (e.g. a volume
+            // boost). Applied before the encoder so aac_eld output is unchanged.
+            if (this.audioFilter) {
+                ffmpegArgs.push('-af', this.audioFilter);
+            }
+            ffmpegArgs.push('-codec:a', 'libfdk_aac', '-profile:a', 'aac_eld', '-flags', '+global_header', '-ar', `${audio.sample_rate}k`, '-b:a', `${audio.max_bit_rate}k`, '-ac', String(audio.channel), '-payload_type', String(audio.pt), '-f', 'rtp');
+            let audioProtocol = 'rtp';
+            if (sessionInfo.audioCryptoSuite ===
+                0 /* this.hap.SRTPCryptoSuites.AES_CM_128_HMAC_SHA1_80 */) {
+                ffmpegArgs.push('-ssrc', String(sessionInfo.audioSSRC), '-srtp_out_suite', 'AES_CM_128_HMAC_SHA1_80', '-srtp_out_params', audioSRTP);
+                audioProtocol = 'srtp';
+            }
+            ffmpegArgs.push(rtpOutputUrl(audioProtocol, address, audioPort, 188, sessionInfo.localAddress));
+        }
+        this.log.debug(`${this.blinkCamera.name} - ffmpeg ${ffmpegArgs.join(' ')}`);
+        const ffmpegVideo = spawn(pathToFfmpeg || 'ffmpeg', ffmpegArgs, {
+            env: process.env,
+        });
+        // For IMMI streams: pipe the stripped MPEG-TS to FFmpeg's stdin.
+        // This avoids the TCP seekability issue where FFmpeg's MPEG-TS demuxer
+        // treats TCP as non-seekable and skips audio PMT scanning.
+        if (rtspProxy?.isImmi && rtspProxy.proxyServer) {
+            const tunnel = rtspProxy.proxyServer;
+            if (!tunnel.isAlive) {
+                this.log.warn(`${this.blinkCamera.name} - IMMI tunnel closed before stream start, aborting`);
+                ffmpegVideo.kill('SIGKILL');
+                this.controller?.forceStopStreamingSession(sessionID);
+                return;
+            }
+            tunnel.dataStream?.pipe(ffmpegVideo.stdin);
+            ffmpegVideo.stdin?.on('error', () => {
+                // EPIPE expected when FFmpeg exits before stream ends
+            });
+        }
+        this.ongoingSessions.set(sessionID, ffmpegVideo);
+        this.streamStartTimes.set(sessionID, Date.now());
+        this.sessionInfoCache.set(sessionID, sessionInfo);
+        this.pendingSessions.delete(sessionID);
+        // Auto-kill stream after 5 minutes to prevent orphaned processes
+        const MAX_STREAM_MS = 5 * 60 * 1000;
+        this.streamTimeouts.set(sessionID, setTimeout(() => {
+            this.log.warn(`${this.blinkCamera.name} - Stream timeout (${MAX_STREAM_MS / 1000}s), stopping`);
+            ffmpegVideo.kill('SIGKILL');
+            this.controller?.forceStopStreamingSession(sessionID);
+        }, MAX_STREAM_MS));
+        let zeroChannelAudioHandled = false;
+        ffmpegVideo.stderr?.on('data', (data) => {
+            const msg = String(data).trim();
+            this.log.debug(`${this.blinkCamera.name} - ffmpeg: ${msg}`);
+            if (msg.includes('bind failed') || msg.includes('Error opening output')) {
+                this.outputErrorSessions.add(sessionID);
+            }
+            if (!zeroChannelAudioHandled &&
+                hasAudio &&
+                msg.includes('Audio:') &&
+                msg.includes('0 channels')) {
+                zeroChannelAudioHandled = true;
+                this.log.warn(`${this.blinkCamera.name} - Audio unavailable, restarting Live View without audio. Enable Audio Streaming in the Blink app (Device Settings → Privacy) to use audio.`);
+                this.restartWithoutAudio(sessionID, video, audio).catch(err => this.log.error(`${this.blinkCamera.name} - Audio-disable restart failed: ${err}`));
+            }
+        });
+        ffmpegVideo.on('error', error => {
+            this.log.error(`${this.blinkCamera.name} - Failed to start ffmpeg: ${error.message}`);
+        });
+        ffmpegVideo.on('exit', (code, signal) => {
+            const timeout = this.streamTimeouts.get(sessionID);
+            if (timeout) {
+                clearTimeout(timeout);
+                this.streamTimeouts.delete(sessionID);
+            }
+            this.log.debug(`${this.blinkCamera.name} - ffmpeg ${signal}`);
+            if (code !== null && code !== 255) {
+                const retries = this.streamRetries.get(sessionID) ?? 0;
+                const isOutputError = this.outputErrorSessions.has(sessionID);
+                this.outputErrorSessions.delete(sessionID);
+                const isRetryable = BlinkCameraDelegate.RETRYABLE_FFMPEG_CODES.has(code) &&
+                    retries < BlinkCameraDelegate.MAX_STREAM_RETRIES &&
+                    !isOutputError;
+                if (isRetryable) {
+                    this.streamRetries.set(sessionID, retries + 1);
+                    this.log.warn(`${this.blinkCamera.name} - LiveView lost (code ${code}), retrying (${retries + 1}/${BlinkCameraDelegate.MAX_STREAM_RETRIES})...`);
+                    this.retryImmiStream(sessionID, video, audio).catch(err => this.log.error(`${this.blinkCamera.name} - Retry failed: ${err}`));
+                }
+                else {
+                    this.streamRetries.delete(sessionID);
+                    this.log.error(`${this.blinkCamera.name} - LiveView ERROR: ${signal} with code: ${code}`);
+                    this.controller?.forceStopStreamingSession(sessionID);
+                }
+            }
+            else {
+                this.streamRetries.delete(sessionID);
+            }
+        });
+    }
+    /**
+     * Respawn ffmpeg without audio mapping while keeping the IMMI tunnel alive.
+     * Used when the camera sends 0-channel audio metadata (audio disabled in
+     * Blink privacy settings), which would otherwise stall the encoder and
+     * block video delivery to HomeKit.
+     */
+    async restartWithoutAudio(sessionID, video, audio) {
+        this.audioDisabledSessions.add(sessionID);
+        // Unpipe the IMMI stripper from the old ffmpeg stdin so it's ready to
+        // feed the replacement ffmpeg. Then kill the stalled ffmpeg — its exit
+        // handler will run but with SIGKILL/null code it just clears the retry
+        // counter and does nothing else.
+        const proxy = this.proxySessions.get(sessionID);
+        const tunnel = proxy?.isImmi && proxy.proxyServer
+            ? proxy.proxyServer
+            : undefined;
+        const oldFfmpeg = this.ongoingSessions.get(sessionID);
+        if (oldFfmpeg) {
+            if (tunnel?.dataStream && oldFfmpeg.stdin) {
+                tunnel.dataStream.unpipe(oldFfmpeg.stdin);
+            }
+            if (!oldFfmpeg.killed) {
+                oldFfmpeg.kill('SIGKILL');
+            }
+        }
+        this.ongoingSessions.delete(sessionID);
+        // Clear the auto-kill timeout from the old session; startStream sets a new one.
+        const timeout = this.streamTimeouts.get(sessionID);
+        if (timeout) {
+            clearTimeout(timeout);
+            this.streamTimeouts.delete(sessionID);
+        }
+        // Restore sessionInfo so startStream can re-use it, then re-enter.
+        // The proxySessions entry (tunnel) is preserved, so the new ffmpeg will
+        // pipe from the same live IMMI stripper.
+        const sessionInfo = this.sessionInfoCache.get(sessionID);
+        if (!sessionInfo) {
+            this.log.warn(`${this.blinkCamera.name} - Audio-disable restart: session info missing, giving up`);
+            this.controller?.forceStopStreamingSession(sessionID);
+            return;
+        }
+        this.pendingSessions.set(sessionID, sessionInfo);
+        await this.startStream(sessionID, video, audio);
+    }
+    async stopStream(sessionID) {
+        this.streamRetries.delete(sessionID);
+        this.sessionInfoCache.delete(sessionID);
+        this.outputErrorSessions.delete(sessionID);
+        this.audioDisabledSessions.delete(sessionID);
+        const startTime = this.streamStartTimes.get(sessionID);
+        const elapsed = startTime
+            ? ((Date.now() - startTime) / 1000).toFixed(1)
+            : '?';
+        this.streamStartTimes.delete(sessionID);
+        if (!this.hideRoutineLogs) {
+            this.log.info(`${this.blinkCamera.name} - LiveView STOP (streamed ${elapsed}s)`);
+        }
+        const timeout = this.streamTimeouts.get(sessionID);
+        if (timeout) {
+            clearTimeout(timeout);
+            this.streamTimeouts.delete(sessionID);
+        }
+        // Check if this was a real live view before cleanup deletes the session
+        const session = this.proxySessions.get(sessionID);
+        const hadLiveView = session?.proxyServer !== undefined;
+        // Clean up temp snapshot file if it exists
+        const tmpPath = join(tmpdir(), `blink-snapshot-${sessionID}.jpg`);
+        unlink(tmpPath).catch(() => { });
+        if (this.proxySessions.has(sessionID)) {
+            try {
+                const rtspProxy = this.proxySessions.get(sessionID);
+                await rtspProxy?.proxyServer?.stop();
+            }
+            catch (e) {
+                this.log.error(`${this.blinkCamera.name} - ERROR:`, e);
+            }
+            this.proxySessions.delete(sessionID);
+        }
+        if (this.ongoingSessions.has(sessionID)) {
+            try {
+                const ffmpegProcess = this.ongoingSessions.get(sessionID);
+                ffmpegProcess?.kill('SIGKILL');
+            }
+            catch (e) {
+                this.log.error(`${this.blinkCamera.name} - Error terminating video process:`, e);
+            }
+            this.ongoingSessions.delete(sessionID);
+        }
+        // After a real live view, request a fresh thumbnail so the Home app
+        // shows a recent image instead of a stale one.
+        // Skip for: image-fallback streams and if a forced refresh already
+        // happened recently (avoid 409s).
+        const shouldRefresh = hadLiveView && Date.now() - this.lastForcedRefresh > 300_000;
+        if (shouldRefresh) {
+            this.lastForcedRefresh = Date.now();
+            this.blinkCamera
+                .refreshThumbnail(true)
+                .catch(e => this.log.debug(`${this.blinkCamera.name} - Post-stream thumbnail refresh failed: ${e}`))
+                .finally(() => this.blinkCamera.clearThumbnailCache());
+        }
+    }
+    /**
+     * Release everything this delegate owns. Called when the accessory is
+     * removed from HomeKit: without it, ffmpeg children keep running and proxy
+     * servers keep holding their ports with nothing left to own them.
+     */
+    async shutdown() {
+        this.destroyed = true;
+        for (const [sessionID, timeout] of this.streamTimeouts) {
+            clearTimeout(timeout);
+            this.streamTimeouts.delete(sessionID);
+        }
+        for (const [sessionID, session] of this.proxySessions) {
+            try {
+                await session.proxyServer?.stop();
+            }
+            catch (e) {
+                this.log.debug(`${this.blinkCamera.name} - Error stopping proxy on shutdown: ${e}`);
+            }
+            this.proxySessions.delete(sessionID);
+        }
+        for (const [sessionID, ffmpegProcess] of this.ongoingSessions) {
+            try {
+                ffmpegProcess?.kill('SIGKILL');
+            }
+            catch (e) {
+                this.log.debug(`${this.blinkCamera.name} - Error killing stream on shutdown: ${e}`);
+            }
+            this.ongoingSessions.delete(sessionID);
+        }
+        this.pendingSessions.clear();
+        this.streamStartTimes.clear();
+        this.streamRetries.clear();
+        this.sessionInfoCache.clear();
+        this.outputErrorSessions.clear();
+        this.audioDisabledSessions.clear();
+    }
+    async retryImmiStream(sessionID, video, audio) {
+        // Clean up old proxy and ffmpeg process
+        const oldProxy = this.proxySessions.get(sessionID);
+        try {
+            await oldProxy?.proxyServer?.stop();
+        }
+        catch {
+            // ignore cleanup errors
+        }
+        const oldFfmpeg = this.ongoingSessions.get(sessionID);
+        if (oldFfmpeg && !oldFfmpeg.killed) {
+            oldFfmpeg.kill('SIGKILL');
+        }
+        this.ongoingSessions.delete(sessionID);
+        await sleep(BlinkCameraDelegate.RETRY_DELAY_MS);
+        if (this.destroyed) {
+            return;
+        }
+        // Request fresh LiveView URL
+        let liveViewURL;
+        try {
+            liveViewURL = await this.blinkCamera.getLiveViewURL(30);
+        }
+        catch (err) {
+            this.log.warn(`${this.blinkCamera.name} - Retry: LiveView request failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        // The liveview request is another suspension point; the accessory may
+        // have been torn down while it was in flight.
+        if (this.destroyed) {
+            return;
+        }
+        if (!liveViewURL?.startsWith('immis')) {
+            this.log.warn(`${this.blinkCamera.name} - Retry: no IMMI URL returned, giving up`);
+            this.streamRetries.delete(sessionID);
+            this.controller?.forceStopStreamingSession(sessionID);
+            return;
+        }
+        // Parse the new IMMI URL and create a fresh tunnel
+        const urlRegex = /([a-z]+):\/\/([^:/]+)(?::[0-9]+)?(\/.*)/;
+        const match = urlRegex.exec(liveViewURL);
+        if (!match) {
+            this.streamRetries.delete(sessionID);
+            this.controller?.forceStopStreamingSession(sessionID);
+            return;
+        }
+        const [, protocol, host, path] = match;
+        const pathWithoutQuery = path.split('?')[0].replace(/^\//, '');
+        const connectionId = pathWithoutQuery.replace(/__.*$/, '');
+        const imdsMatch = pathWithoutQuery.match(/__IMDS_(.+)$/);
+        const serial = imdsMatch ? imdsMatch[1].substring(0, 16) : '';
+        const clientIdParam = new URL(liveViewURL.replace('immis://', 'https://')).searchParams.get('client_id');
+        const clientId = clientIdParam ? parseInt(clientIdParam, 10) : 0;
+        const [listenPort] = await reservePorts({ count: 1 });
+        const proxyServer = await this.createImmiTunnel(listenPort, host, clientId, connectionId, serial);
+        this.proxySessions.set(sessionID, {
+            protocol,
+            host,
+            path,
+            listenPort,
+            proxyServer,
+            isImmi: true,
+        });
+        this.log.debug(`${this.blinkCamera.name} - LiveView: ${liveViewURL}`);
+        // Restore sessionInfo from cache so startStream can access it
+        const sessionInfo = this.sessionInfoCache.get(sessionID);
+        if (!sessionInfo) {
+            this.log.warn(`${this.blinkCamera.name} - Retry: session info missing, giving up`);
+            this.streamRetries.delete(sessionID);
+            this.controller?.forceStopStreamingSession(sessionID);
+            return;
+        }
+        this.pendingSessions.set(sessionID, sessionInfo);
+        await this.startStream(sessionID, video, audio);
+    }
+    async createImmiTunnel(listenPort, targetHost, clientId, connectionId, serial) {
+        const proxyServer = new ImmiTunnel(listenPort, targetHost, '0.0.0.0', 443, clientId, connectionId, serial, this.log);
+        await proxyServer.start();
+        return proxyServer;
+    }
+}
+//# sourceMappingURL=cameraDelegate.js.map
